@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - han/feature/release-elf-and-program
     tags:
       - 'v*'
 
