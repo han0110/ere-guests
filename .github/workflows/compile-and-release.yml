@@ -92,11 +92,11 @@ jobs:
 
       - name: Generate release notes
         run: |
+          echo "## Compiled guest programs" >> release-body.md
+          echo "" >> release-body.md
           echo "This release contains compiled guest programs for various zkVMs." > release-body.md
           echo "" >> release-body.md
           echo "Built with Ere compiler version: \`${{ needs.compile.outputs.ere_tag }}\`." >> release-body.md
-          echo "" >> release-body.md
-          echo "## Compiled guest programs" >> release-body.md
           echo "" >> release-body.md
 
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
@@ -162,11 +162,16 @@ jobs:
           echo "Signing complete. Contents of artifacts:"
           ls -R artifacts
 
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifacts to release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          name: Compiled Guests (${{ github.ref_name }})
-          files: artifacts/*
-          body_path: release-body.md
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" artifacts/* --clobber
+
+      - name: Append artifact info to release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING="$(gh release view "${{ github.ref_name }}" --json body -q .body)"
+          gh release edit "${{ github.ref_name }}" --notes "${EXISTING}
+
+          $(cat release-body.md)"
