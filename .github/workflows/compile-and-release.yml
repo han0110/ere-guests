@@ -138,42 +138,6 @@ jobs:
             echo "" >> release-body.md
           done
 
-      - name: Install Minisign
-        run: sudo apt-get update && sudo apt-get install -y minisign
-
-      - name: Sign Artifacts
-        env:
-          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-          MINISIGN_PUBLIC_KEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
-          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
-        run: |
-          # Create key files from secrets
-          echo "$MINISIGN_SECRET_KEY" > minisign.key
-          echo "$MINISIGN_PUBLIC_KEY" > minisign.pub
-
-          echo "Starting signing process..."
-
-          # Iterate over artifacts and sign them
-          for file in artifacts/*; do
-            if [ -f "$file" ]; then
-              filename=$(basename "$file")
-              echo "Signing $filename..."
-
-              # -S: Sign, -m: file, -s: secret key, -x: output signature, -t: trusted comment
-              # We output the .minisig directly into the artifacts folder so it gets released
-              echo "$MINISIGN_PASSWORD" | minisign -Sm "$file" -s minisign.key -x "$file.minisig" -t "$filename"
-            fi
-          done
-
-          # Move the public key into artifacts so it is included in the release
-          cp minisign.pub artifacts/
-
-          # Cleanup secret key
-          rm minisign.key
-
-          echo "Signing complete. Contents of artifacts:"
-          ls -R artifacts
-
       - name: Upload artifacts to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
