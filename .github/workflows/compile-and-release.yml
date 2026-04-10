@@ -141,13 +141,13 @@ jobs:
       - name: Upload artifacts to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.check-tag.outputs.tag }}" artifacts/* --clobber
+        run: gh release upload --repo "${{ github.repository }}" "${{ needs.check-tag.outputs.tag }}" artifacts/* --clobber
 
       - name: Append artifact info to release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          EXISTING="$(gh release view "${{ needs.check-tag.outputs.tag }}" --json body -q .body)"
-          gh release edit "${{ needs.check-tag.outputs.tag }}" --notes "${EXISTING}
+          EXISTING="$(gh release view --repo "${{ github.repository }}" "${{ needs.check-tag.outputs.tag }}" --json body -q .body)"
+          gh release edit --repo "${{ github.repository }}" "${{ needs.check-tag.outputs.tag }}" --notes "${EXISTING}
 
           $(cat release-body.md)"
