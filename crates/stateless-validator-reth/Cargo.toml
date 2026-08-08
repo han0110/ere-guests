@@ -9,7 +9,10 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+bumpalo.workspace = true
+bytes.workspace = true
 once_cell.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 
 # alloy
@@ -17,7 +20,10 @@ alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-genesis = { workspace = true, features = ["serde-bincode-compat"] }
 alloy-primitives = { workspace = true, features = ["map-foldhash", "map-indexmap"] }
+alloy-rlp.workspace = true
+alloy-rpc-types-debug.workspace = true
 alloy-rpc-types-engine = { workspace = true, features = ["serde"] }
+alloy-trie.workspace = true
 
 # revm
 revm.workspace = true
@@ -29,6 +35,7 @@ reth-evm-ethereum.workspace = true
 reth-payload-validator.workspace = true
 reth-primitives-traits.workspace = true
 reth-stateless.workspace = true
+reth-trie-common.workspace = true
 reth-tries.workspace = true
 
 # zkvm-standard

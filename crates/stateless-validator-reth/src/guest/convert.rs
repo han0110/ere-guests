@@ -50,6 +50,9 @@ pub(crate) struct RethInput {
     pub(crate) block: Block<reth_ethereum_primitives::TransactionSigned>,
     pub(crate) witness: reth_stateless::ExecutionWitness,
     pub(crate) public_keys: Vec<UncompressedPublicKey>,
+    /// Transaction root derived while rebuilding the block, which validation would otherwise
+    /// recompute from the same body.
+    pub(crate) transaction_root: B256,
 }
 
 /// Converts the decoded canonical stateless input into the reth validation
@@ -60,7 +63,9 @@ pub(crate) fn to_reth_input(fork: ProtocolFork, input: StatelessInput) -> Result
         ..Default::default()
     }));
     let evm_config = EthEvmConfig::new(chain_spec.clone());
-    let block = to_reth_block(input.new_payload_request, chain_spec.clone())?.into_block();
+    let sealed_block = to_reth_block(input.new_payload_request, chain_spec.clone())?;
+    let transaction_root = sealed_block.header().transactions_root;
+    let block = sealed_block.into_block();
     let witness = to_reth_witness(input.witness);
     let public_keys = Vec::from_iter(input.public_keys.into_iter().map(UncompressedPublicKey));
     Ok(RethInput {
@@ -69,6 +74,7 @@ pub(crate) fn to_reth_input(fork: ProtocolFork, input: StatelessInput) -> Result
         block,
         witness,
         public_keys,
+        transaction_root,
     })
 }
 

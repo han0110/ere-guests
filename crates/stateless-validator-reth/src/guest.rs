@@ -4,7 +4,6 @@ use alloc::{format, vec::Vec};
 
 pub use ere_platform_core::Platform;
 use reth_stateless::{stateless_validation_with_trie, validation::StatelessValidationError};
-use reth_tries::zeth::SparseState;
 use stateless_validator_common::{
     HashTreeRoot, SszEncode as _,
     guest::{StatelessInput, StatelessValidationResult, input::ProtocolFork},
@@ -13,11 +12,13 @@ use stateless_validator_common::{
 use crate::guest::{
     convert::{RethInput, to_reth_input},
     crypto::sha256_hasher,
+    path::PathState,
 };
 
 mod convert;
 pub mod crypto;
 mod error;
+mod path;
 
 pub use crate::guest::error::Error;
 
@@ -83,12 +84,18 @@ fn verify_stateless_new_payload<P: Platform>(
 /// Validates the reconstructed payload, reporting a rejected payload as an
 /// error.
 fn run_validation(input: RethInput) -> Result<(), StatelessValidationError> {
-    stateless_validation_with_trie::<SparseState, _, _>(
+    stateless_validation_with_trie::<PathState, _, _>(
         input.block,
         input.public_keys,
         input.witness,
         input.chain_spec,
         input.evm_config,
+        // The block was rebuilt from a consensus-layer payload, which carries no transaction root,
+        // so the root in its header is one this guest just derived from the same body. Handing it
+        // over keeps validation from deriving it a second time. The cross-check that dropping it
+        // gives up, that each transaction re-encodes to the bytes it arrived as, is already what
+        // `decode_2718_exact` enforces while the block is rebuilt.
+        Some(input.transaction_root),
     )?;
     Ok(())
 }

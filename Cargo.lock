@@ -276,9 +276,9 @@ dependencies = [
 
 [[package]]
 name = "alloy-rpc-types-debug"
-version = "2.1.1"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9e9c1f9ac81c56b2d96901201db7eb95c4e9fc3c21237a4690f8c652aa62089"
+checksum = "bddf06191e2b12eaaeb3a50ef29a8f3416fb74c61421b80f9d7554c4c1d59a56"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -5328,7 +5328,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stateless"
 version = "0.1.0"
-source = "git+https://github.com/han0110/stateless?rev=b2520535b14ab8fec4ee3b14f28c4136f1e25400#b2520535b14ab8fec4ee3b14f28c4136f1e25400"
+source = "git+https://github.com/han0110/stateless?rev=39aa4271b9fd728a35f225eb369f5efab7b817d5#39aa4271b9fd728a35f225eb369f5efab7b817d5"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5433,7 +5433,12 @@ dependencies = [
  "alloy-eips",
  "alloy-genesis",
  "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-debug",
  "alloy-rpc-types-engine",
+ "alloy-trie",
+ "bumpalo",
+ "bytes",
  "ere-dockerized",
  "ere-platform-core",
  "once_cell",
@@ -5443,7 +5448,9 @@ dependencies = [
  "reth-evm-ethereum",
  "reth-payload-validator",
  "reth-primitives-traits",
+ "reth-trie-common",
  "revm",
+ "smallvec",
  "stateless",
  "stateless-validator-common",
  "stateless-validator-test",
@@ -5950,7 +5957,7 @@ dependencies = [
 [[package]]
 name = "tries"
 version = "0.1.0"
-source = "git+https://github.com/han0110/stateless?rev=b2520535b14ab8fec4ee3b14f28c4136f1e25400#b2520535b14ab8fec4ee3b14f28c4136f1e25400"
+source = "git+https://github.com/han0110/stateless?rev=39aa4271b9fd728a35f225eb369f5efab7b817d5#39aa4271b9fd728a35f225eb369f5efab7b817d5"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -6533,7 +6540,7 @@ dependencies = [
 [[package]]
 name = "zeth-mpt"
 version = "0.1.0"
-source = "git+https://github.com/han0110/stateless?rev=b2520535b14ab8fec4ee3b14f28c4136f1e25400#b2520535b14ab8fec4ee3b14f28c4136f1e25400"
+source = "git+https://github.com/han0110/stateless?rev=39aa4271b9fd728a35f225eb369f5efab7b817d5#39aa4271b9fd728a35f225eb369f5efab7b817d5"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
