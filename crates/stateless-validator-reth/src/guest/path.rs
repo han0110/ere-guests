@@ -8,66 +8,123 @@
 //! Looking a node up by the hash its parent commits to is what verifies it, so a node is trusted
 //! precisely when a walk reaches it, and a reference the witness has no node for is a witness too
 //! incomplete to validate against. That also bounds the shapes this has to handle to the ones the
-//! chain holds, with paths of at most [`MAX_NIBBLES`] nibbles, empty branch value slots because
-//! every key is a hash of one length, and no empty extension path. Every malformed encoding is an
-//! error rather than a panic, so a bad witness can cost a block its validation but never its
-//! correctness.
+//! chain holds, and every one of those bounds is checked rather than assumed. Paths hold at most
+//! [`MAX_NIBBLES`] nibbles and an extension holds at least one, a node is referenced through no
+//! more than a digest, a leaf carries no more than an account, and a branch value slot is empty
+//! because every key is a hash of one length. Every malformed encoding is an error rather than a
+//! panic, so a bad witness can cost a block its validation but never its correctness.
+//!
+//! Those checks are also what bounds the scratch the descent builds in, which `stack.rs` derives
+//! from the arms below.
 //!
 //! Modelled on the trie zesu proves its stateless guest with, `src/stateless/mpt` of
 //! <https://github.com/eth-act/zesu>, whose `verifyProofIndexed`, `batchUpdateIndexed` and
 //! `updNodeExImpl` this mirrors.
 
-use alloc::{boxed::Box, vec::Vec};
+mod encode;
+mod error;
+mod nibbles;
+mod node;
+mod stack;
+#[cfg(test)]
+mod tests;
+
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::cell::RefCell;
 
 use alloy_primitives::{
     Address, B256, Bytes, KECCAK256_EMPTY, U256, keccak256,
     map::{B256IndexMap, B256Map},
 };
-use alloy_rlp::{Decodable, Encodable};
+use alloy_rlp::Decodable;
 use alloy_rpc_types_debug::ExecutionWitness;
 use alloy_trie::{EMPTY_ROOT_HASH, TrieAccount};
-use bumpalo::Bump;
 use reth_trie_common::{HashedPostState, HashedStorageSorted};
 use reth_tries::{StatelessTrie, StatelessTrieError, WitnessDbError};
 
-/// Length of a node reference that is a Keccak digest rather than the node's own encoding.
-const DIGEST_LEN: usize = 32;
+use crate::guest::path::{
+    encode::{
+        Carried, encode_branch, encode_extension, encode_extension_encoded, encode_leaf,
+        encode_leaf_from_key, encode_value, reference, splice_branch,
+    },
+    error::Error,
+    nibbles::{
+        MAX_NIBBLES, common_prefix_len, hex_prefix_decode, key_nibbles, merge_paths, nibble_at,
+        path_from,
+    },
+    node::{
+        DIGEST_LEN, EMPTY_NODE, Filled, MAX_BRANCH_RLP, Node, branch_children, decode_node,
+        filled_children, is_empty_node, split_payload,
+    },
+    stack::{DynStack, STACK_LEN},
+};
 
-/// Nibbles in a key, which is always a 32-byte hash here.
-const MAX_NIBBLES: usize = 2 * DIGEST_LEN;
+/// One key's new value as an index into the change source, or `None` to remove it.
+type Change = (B256, Option<u32>);
 
-/// Longest hex-prefix encoding of a path, which is a flag byte plus a whole key.
-const MAX_ENCODED_PATH: usize = 1 + DIGEST_LEN;
+/// The values a change set carries, encoded only once the descent reaches the leaf that holds them
+/// so nothing a change set contributes outlives the node it is copied into.
+///
+/// A change names its value by the index it took in the source the caller drew it from, so an
+/// implementation is whatever slice that source is.
+trait ChangedValues {
+    /// The RLP of the value at `index`.
+    fn encode<'s>(&self, index: u32, stack: &mut DynStack<'s>) -> &'s [u8];
+}
 
-/// Longest RLP encoding of a [`TrieAccount`], which a 9-byte nonce, a 33-byte balance and two
-/// 33-byte hashes hold to 110.
-const MAX_ACCOUNT_RLP: usize = 128;
+/// Accounts, each already carrying the storage root recomputing it produced.
+impl ChangedValues for [TrieAccount] {
+    fn encode<'s>(&self, index: u32, stack: &mut DynStack<'s>) -> &'s [u8] {
+        encode_value(self[index as usize], stack)
+    }
+}
 
-/// Longest RLP encoding of a storage value, which is a 32-byte integer behind its header.
-const MAX_STORAGE_RLP: usize = 1 + DIGEST_LEN;
+/// Storage slots, indexed as the change set that named them.
+impl ChangedValues for [(B256, U256)] {
+    fn encode<'s>(&self, index: u32, stack: &mut DynStack<'s>) -> &'s [u8] {
+        encode_value(self[index as usize].1, stack)
+    }
+}
 
-/// RLP of the empty node, which is also how a parent references an absent child.
-const EMPTY_NODE: &[u8] = &[alloy_rlp::EMPTY_STRING_CODE];
-
-/// One key's new value, or `None` to remove it.
-type Change = (B256, Option<&'static [u8]>);
+/// A child whose encoding this frame holds rather than the witness, named by the nibble it sits
+/// under, since looking a node the descent built up by hash is the one lookup the witness cannot
+/// answer.
+///
+/// A collapse happens only when a single child is left, so at most one child a frame builds can
+/// survive it and every other child a collapse could reach is still an item the witness supplied.
+type Prebuilt<'s> = Option<(u8, &'s [u8])>;
 
 /// The Ethereum world state over the witness bytes, walked rather than built.
 #[derive(Debug)]
 pub(crate) struct PathState {
-    /// Trie nodes by the Keccak hash they are referenced through, from the witness and from
-    /// whatever recomputing the root builds on top of it.
+    /// Trie nodes by the Keccak hash they are referenced through, which the witness supplies and
+    /// nothing the descent builds ever joins.
     nodes: B256Map<&'static [u8]>,
-    /// Arena the nodes built while recomputing the root live in.
-    bump: &'static Bump,
     /// Root every read is anchored at, which the parent block header commits to.
     root: B256,
-    /// Accounts the state trie has already been walked for, holding the value they had before
+    /// Accounts the state trie holds and a read has already walked it for, as they stood before
     /// execution. Execution reads an account and then its storage, which would otherwise walk the
-    /// state trie twice for every account whose storage a block touches.
-    accounts: RefCell<B256Map<Option<TrieAccount>>>,
+    /// state trie twice for every account whose storage a block touches. An account the trie has
+    /// none of is left out, since a block reading a great many of those would fill this with
+    /// entries answering only the reads that never come.
+    accounts: RefCell<B256Map<TrieAccount>>,
+    /// Where a read stands once it has taken the first nibbles of its key, held per trie and
+    /// prefix.
+    ///
+    /// Every read of one trie crosses the same nodes near its root, so a block reading a thousand
+    /// accounts, or a thousand slots of one account, would otherwise split those nodes and look
+    /// their children up by digest a thousand times over. Deeper down a witness holds far more
+    /// nodes than any block reads twice, so a read stops recording there. Each entry carries
+    /// the root it was taken from, so the tries read alongside one another share the room
+    /// rather than evicting one another.
+    prefix_nodes: RefCell<[Option<PrefixNode>; 1 << (4 * PREFIX_NIBBLES)]>,
 }
+
+/// The trie a read was walking, the nibbles of its key it had taken and the node it had reached.
+type PrefixNode = (B256, usize, &'static [u8]);
+
+/// Nibbles of a key a prefix covers, which are the ones its first byte holds.
+const PREFIX_NIBBLES: usize = 2;
 
 impl StatelessTrie for PathState {
     fn new(
@@ -83,7 +140,6 @@ impl StatelessTrie for PathState {
             .iter()
             .map(|rlp| (keccak256(rlp), rlp.as_ref()))
             .collect();
-        let bump: &'static Bump = Box::leak(Box::new(Bump::new()));
 
         let bytecode = witness
             .codes
@@ -94,9 +150,9 @@ impl StatelessTrie for PathState {
         Ok((
             Self {
                 nodes,
-                bump,
                 root: pre_state_root,
                 accounts: RefCell::new(B256Map::default()),
+                prefix_nodes: RefCell::new([None; 1 << (4 * PREFIX_NIBBLES)]),
             },
             bytecode,
         ))
@@ -110,6 +166,12 @@ impl StatelessTrie for PathState {
         let Some(account) = self.account_at(keccak256(address))? else {
             return Ok(U256::ZERO);
         };
+        // An account holding no storage answers every slot with zero, so the slot is hashed only
+        // where there is a trie to look it up in. A block reading cold slots of accounts that hold
+        // none would otherwise pay a hash for every one of them.
+        if account.storage_root == EMPTY_ROOT_HASH {
+            return Ok(U256::ZERO);
+        }
         Ok(
             match self.get(account.storage_root, &keccak256(B256::from(slot)))? {
                 Some(mut value) => U256::decode(&mut value)?,
@@ -119,33 +181,37 @@ impl StatelessTrie for PathState {
     }
 
     fn calculate_state_root(&mut self, state: HashedPostState) -> Result<B256, StatelessTrieError> {
+        // Every trie recomputed here builds in this one buffer, which a descent hands back whole
+        // because it returns a hash rather than a borrow. Lending it out rather than holding it in
+        // the state is what leaves no descent able to run inside another.
+        let mut scratch = vec![0; STACK_LEN];
+
         let state = state.into_sorted();
 
         // Every account whose storage changed also has its leaf rewritten, since the leaf commits
         // to the storage root, so one pass over the accounts covers both tries.
         let mut changes = Vec::with_capacity(state.accounts.len());
+        let mut accounts = Vec::with_capacity(state.accounts.len());
         for (hashed_address, account) in &state.accounts {
             let Some(account) = account else {
                 changes.push((*hashed_address, None));
                 continue;
             };
+            let storage = state.storages.get(hashed_address);
             let storage_root = self
-                .storage_root(*hashed_address, state.storages.get(hashed_address))
+                .storage_root(*hashed_address, storage, &mut scratch)
                 .map_err(|_| StatelessTrieError::StatelessStateRootCalculationFailed)?;
-            let value = encode_value::<MAX_ACCOUNT_RLP>(
-                self.bump,
-                TrieAccount {
-                    nonce: account.nonce,
-                    balance: account.balance,
-                    storage_root,
-                    code_hash: account.bytecode_hash.unwrap_or(KECCAK256_EMPTY),
-                },
-            );
-            changes.push((*hashed_address, Some(value)));
+            changes.push((*hashed_address, Some(accounts.len() as u32)));
+            accounts.push(TrieAccount {
+                nonce: account.nonce,
+                balance: account.balance,
+                storage_root,
+                code_hash: account.bytecode_hash.unwrap_or(KECCAK256_EMPTY),
+            });
         }
 
         let root = self.root;
-        self.batch_update(root, &changes)
+        self.batch_update(root, accounts.as_slice(), &changes, &mut scratch)
             .map_err(|_| StatelessTrieError::StatelessStateRootCalculationFailed)
     }
 }
@@ -161,7 +227,10 @@ impl PathState {
     }
 
     /// The node a parent references through `item`, or the empty node when the slot is absent.
-    fn child(&self, item: &'static [u8]) -> Result<&'static [u8], Error> {
+    ///
+    /// A child is an empty slot or a digest everywhere but the shortest of nodes, and its first
+    /// byte tells which, so resolving one reads a byte rather than decoding a header.
+    fn resolve_child<'s>(&self, item: &'s [u8]) -> Result<&'s [u8], Error> {
         let mut buf = item;
         let header = alloy_rlp::Header::decode(&mut buf)?;
         if header.list {
@@ -170,7 +239,7 @@ impl PathState {
         let payload = split_payload(&mut buf, header.payload_length)?;
         match payload.len() {
             0 => Ok(EMPTY_NODE),
-            DIGEST_LEN => self.resolve(B256::from_slice(payload)),
+            DIGEST_LEN => Ok(self.resolve(B256::from_slice(payload))?),
             _ => Err(Error::Rlp(alloy_rlp::Error::UnexpectedLength)),
         }
     }
@@ -181,70 +250,78 @@ impl PathState {
         if root == EMPTY_ROOT_HASH {
             return Ok(None);
         }
-        let nibbles = key_nibbles(key);
-        let mut remaining = nibbles.as_slice();
-        let mut node_rlp = self.resolve(root)?;
-        let mut buf = [0; MAX_NIBBLES];
+        // The key stays packed, since a node's path is compared against the bytes it already sits
+        // in and a walk of a level or two would never look at most of the nibbles in it.
+        let prefix = usize::from(key[0]);
+        let (mut depth, mut node_rlp) = match self.prefix_nodes.borrow()[prefix] {
+            Some((held, depth, node_rlp)) if held == root => (depth, node_rlp),
+            _ => (0, self.resolve(root)?),
+        };
 
         loop {
-            if let Some((&nibble, rest)) = remaining.split_first()
-                && let Some(item) = decode_branch_child(node_rlp, nibble)?
-            {
-                let child = self.child(item)?;
-                if is_empty_node(child) {
-                    return Ok(None);
-                }
-                node_rlp = child;
-                remaining = rest;
-                continue;
+            // A read stops recording where it leaves the nibbles an entry is held per, so what
+            // stands is the deepest node every key sharing them reaches.
+            if depth <= PREFIX_NIBBLES {
+                self.prefix_nodes.borrow_mut()[prefix] = Some((root, depth, node_rlp));
+            }
+            // A slot the parent left empty ends the walk, since the key is under it or nowhere.
+            if is_empty_node(node_rlp) {
+                return Ok(None);
             }
 
             match decode_node(node_rlp)? {
                 Node::Leaf { path, value } => {
-                    let path = hex_prefix_nibbles(path, &mut buf)?;
-                    return Ok((path == remaining).then_some(value));
-                }
-                Node::Extension { path, child } => {
-                    let path = hex_prefix_nibbles(path, &mut buf)?;
-                    let Some(rest) = remaining.strip_prefix(path) else {
+                    let Some(taken) = path_from(key, depth, path) else {
                         return Ok(None);
                     };
-                    let child = self.child(child)?;
-                    if is_empty_node(child) {
-                        return Ok(None);
-                    }
-                    node_rlp = child;
-                    remaining = rest;
+                    // A leaf ends exactly where a key does, so one reaching any other depth holds
+                    // the key of no trie this walks.
+                    return Ok((depth + taken == MAX_NIBBLES).then_some(value));
                 }
-                // Every key is one length, so no key ends where a branch sits.
-                Node::Branch(_) => return Err(Error::ValueInBranch),
+                Node::Extension { path, child } => {
+                    let Some(taken) = path_from(key, depth, path) else {
+                        return Ok(None);
+                    };
+                    node_rlp = self.resolve_child(child)?;
+                    depth += taken;
+                }
+                // Only a branch's value slot answers a key that has run out, and it stays empty
+                // because every key is a hash of one length.
+                Node::Branch(branch) => {
+                    if depth == MAX_NIBBLES {
+                        return Err(Error::ValueInBranch);
+                    }
+                    node_rlp = self.resolve_child(branch.child(nibble_at(key, depth))?)?;
+                    depth += 1;
+                }
             }
         }
     }
 
     /// The account the state trie records under `hashed_address`, walking the trie for it only the
-    /// first time it is asked for.
+    /// first time it is asked for and every time for an account the trie holds none of.
     ///
     /// Recomputing the state root reads each account before writing it back, so the values held
     /// here stay the ones the trie was read with.
     fn account_at(&self, hashed_address: B256) -> Result<Option<TrieAccount>, Error> {
         if let Some(account) = self.accounts.borrow().get(&hashed_address) {
-            return Ok(*account);
+            return Ok(Some(*account));
         }
-        let account = match self.get(self.root, &hashed_address)? {
-            Some(mut value) => Some(TrieAccount::decode(&mut value)?),
-            None => None,
+        let Some(mut value) = self.get(self.root, &hashed_address)? else {
+            return Ok(None);
         };
+        let account = TrieAccount::decode(&mut value)?;
         self.accounts.borrow_mut().insert(hashed_address, account);
-        Ok(account)
+        Ok(Some(account))
     }
 
     /// The storage root an account ends the block with, applying `storage` to the trie it held
     /// before execution.
     fn storage_root(
-        &mut self,
+        &self,
         hashed_address: B256,
         storage: Option<&HashedStorageSorted>,
+        scratch: &mut [u8],
     ) -> Result<B256, Error> {
         let root = self
             .account_at(hashed_address)?
@@ -253,185 +330,450 @@ impl PathState {
             return Ok(root);
         };
 
-        let bump = self.bump;
         let changes: Vec<Change> = storage
             .storage_slots
             .iter()
-            .map(|(slot, value)| {
-                let value =
-                    (!value.is_zero()).then(|| encode_value::<MAX_STORAGE_RLP>(bump, *value));
-                (*slot, value)
-            })
+            .enumerate()
+            .map(|(index, (slot, value))| (*slot, (!value.is_zero()).then_some(index as u32)))
             .collect();
         // Wiping drops the account's storage, so what is left is only what execution wrote back.
         let root = if storage.wiped { EMPTY_ROOT_HASH } else { root };
-        self.batch_update(root, &changes)
+        self.batch_update(root, storage.storage_slots.as_slice(), &changes, scratch)
     }
 
     /// Applies `changes`, ordered by key, to the trie rooted at `root` and returns the new root.
-    fn batch_update(&mut self, root: B256, changes: &[Change]) -> Result<B256, Error> {
+    fn batch_update<V: ChangedValues + ?Sized>(
+        &self,
+        root: B256,
+        values: &V,
+        changes: &[Change],
+        scratch: &mut [u8],
+    ) -> Result<B256, Error> {
         if changes.is_empty() {
             return Ok(root);
         }
+        // Ordered, distinct keys are what leave each branch's children a contiguous sub-slice, so
+        // descent covers the whole change set, no key reaches a node twice, and both the depth a
+        // descent runs to and the scratch it holds stay bounded by the trie. Every change set comes
+        // from a map the caller sorted, so this holds by construction.
+        debug_assert!(
+            changes.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "a change set is ordered by key"
+        );
         let node_rlp = if root == EMPTY_ROOT_HASH {
             EMPTY_NODE
         } else {
             self.resolve(root)?
         };
-        let root_rlp = self.update(node_rlp, changes, 0)?;
-        Ok(if is_empty_node(root_rlp) {
-            EMPTY_ROOT_HASH
-        } else {
-            keccak256(root_rlp)
-        })
+        let mut stack = DynStack::new(scratch);
+        let descent = Descent {
+            state: self,
+            values,
+        };
+        descent
+            .update(node_rlp, changes, 0, &mut stack)
+            .map(|root_rlp| {
+                if is_empty_node(root_rlp) {
+                    EMPTY_ROOT_HASH
+                } else {
+                    keccak256(root_rlp)
+                }
+            })
     }
+}
 
+/// What every frame of one descent reads, which is fixed for the whole change set and so stays
+/// clear of the arguments the recursion carries.
+struct Descent<'a, V: ChangedValues + ?Sized> {
+    /// The trie the descent walks.
+    state: &'a PathState,
+    /// The values its change set draws on.
+    values: &'a V,
+}
+
+impl<V: ChangedValues + ?Sized> Descent<'_, V> {
     /// Applies every change in `changes`, all of whose keys reach this node, and returns the RLP of
     /// the node that replaces it.
     ///
-    /// Ordered changes make each branch's children contiguous runs, so one descent covers the whole
-    /// change set and no node is decoded or re-encoded twice.
-    fn update(
-        &mut self,
-        node_rlp: &'static [u8],
+    /// Ordered changes leave each branch's children a contiguous sub-slice of the change set, so
+    /// one descent covers the whole of it and no node is decoded or re-encoded twice.
+    fn update<'s>(
+        &self,
+        node_rlp: &'s [u8],
         changes: &[Change],
         depth: usize,
-    ) -> Result<&'static [u8], Error> {
+        stack: &mut DynStack<'s>,
+    ) -> Result<&'s [u8], Error> {
         if let [(key, value)] = changes {
-            // A deletion can collapse a branch below, which resolves the node that replaces it by
-            // hash, so only a deletion needs its new nodes in the index.
-            let nibbles = key_nibbles(key);
-            return self.update_one(node_rlp, &nibbles[depth..], *value, value.is_none());
+            return self.update_one(node_rlp, key, depth, *value, stack);
         }
 
-        let branch = if is_empty_node(node_rlp) {
-            None
-        } else {
-            match decode_node(node_rlp)? {
-                Node::Branch(payload) => Some(branch_children(payload)?),
-                Node::Leaf { .. } | Node::Extension { .. } => None,
-            }
-        };
-
-        // An empty subtree, or a leaf or extension several keys share, is shaped by each change in
-        // turn, since what one leaves behind decides what the next descends into.
-        let Some(mut children) = branch else {
-            let mut current = node_rlp;
-            for (key, value) in changes {
-                let nibbles = key_nibbles(key);
-                current = self.update_one(current, &nibbles[depth..], *value, true)?;
-            }
-            return Ok(current);
-        };
-
-        let has_deletion = changes.iter().any(|(_, value)| value.is_none());
-        let mut start = 0;
-        while start < changes.len() {
-            let nibble = nibble_at(&changes[start].0, depth);
-            let mut end = start + 1;
-            while end < changes.len() && nibble_at(&changes[end].0, depth) == nibble {
-                end += 1;
-            }
-            let child = self.child(children[nibble as usize])?;
-            let updated = self.update(child, &changes[start..end], depth + 1)?;
-            children[nibble as usize] = self.reference(updated, has_deletion);
-            start = end;
-        }
-
-        if has_deletion {
-            match filled_children(&children) {
-                Filled::None => return Ok(EMPTY_NODE),
-                Filled::One(nibble) => return self.collapse(nibble, children[nibble as usize]),
-                Filled::Many => {}
-            }
-        }
-        Ok(encode_branch(self.bump, &children))
-    }
-
-    /// Applies one change to this node, whose subtree its key reaches with `remaining` nibbles
-    /// left.
-    fn update_one(
-        &mut self,
-        node_rlp: &'static [u8],
-        remaining: &[u8],
-        value: Option<&'static [u8]>,
-        index: bool,
-    ) -> Result<&'static [u8], Error> {
+        // An empty subtree is shaped by the change set alone, so it is built in one top-down pass
+        // rather than by inserting one key at a time.
         if is_empty_node(node_rlp) {
-            return Ok(match value {
-                Some(value) => encode_leaf(self.bump, remaining, value),
-                None => EMPTY_NODE,
-            });
+            return self.build_subtree(changes, depth, None, stack);
         }
 
         match decode_node(node_rlp)? {
-            Node::Branch(payload) => {
-                let Some((&nibble, rest)) = remaining.split_first() else {
-                    return Err(Error::ValueInBranch);
-                };
-                let (start, end) = child_span(payload, nibble)?;
-                let child = self.child(&payload[start..end])?;
-                let updated = self.update_one(child, rest, value, index)?;
-                let item = self.reference(updated, index);
+            Node::Leaf { path, value } => self.update_leaf(path, value, changes, depth, stack),
+            Node::Extension { path, child } => {
+                self.update_extension(path, child, changes, depth, stack)
+            }
+            Node::Branch(branch) => self.update_branch(
+                branch_children(branch.payload)?,
+                changes,
+                depth,
+                None,
+                stack,
+            ),
+        }
+    }
 
-                // A deletion can leave the branch with a single child or none at all, which only
-                // inspecting every one of them tells, so it takes the path that materializes them.
-                if value.is_none() {
-                    let mut children = branch_children(payload)?;
-                    children[nibble as usize] = item;
-                    return match filled_children(&children) {
-                        Filled::None => Ok(EMPTY_NODE),
-                        Filled::One(nibble) => self.collapse(nibble, children[nibble as usize]),
-                        Filled::Many => Ok(encode_branch(self.bump, &children)),
-                    };
+    /// The RLP of the subtree that replaces this leaf, which keeps the leaf itself only when no
+    /// change names its key.
+    fn update_leaf<'s>(
+        &self,
+        path: &[u8],
+        value: &'s [u8],
+        changes: &[Change],
+        depth: usize,
+        stack: &mut DynStack<'s>,
+    ) -> Result<&'s [u8], Error> {
+        let mut buf = [0; MAX_NIBBLES];
+        let leaf_path = hex_prefix_decode(path, &mut buf)?;
+        // Every key is a hash of one length, so a leaf ends exactly where a key does. A path any
+        // longer would carry the split past the last nibble a key has.
+        if depth + leaf_path.len() != MAX_NIBBLES {
+            return Err(Error::MalformedPath);
+        }
+        // A change naming the leaf's own key replaces or removes it, so the leaf survives as an
+        // entry of its own only when no change reaches it.
+        let overridden = changes
+            .binary_search_by(|(key, _)| key_nibbles(key)[depth..].cmp(leaf_path))
+            .is_ok();
+        let existing = (!overridden).then_some((leaf_path, value));
+        self.build_subtree(changes, depth, existing, stack)
+    }
+
+    /// The RLP of the node that replaces this extension, which is a branch when the change set
+    /// leaves its path part way along.
+    fn update_extension<'s>(
+        &self,
+        encoded: &[u8],
+        child: &'s [u8],
+        changes: &[Change],
+        depth: usize,
+        stack: &mut DynStack<'s>,
+    ) -> Result<&'s [u8], Error> {
+        // Sorted keys put every change between the first and the last, so a path those two both
+        // follow is one they all follow and the whole change set stays inside this extension. Their
+        // keys stay packed for it, since an extension the set stays inside keeps its own encoding.
+        if let Some(taken) = path_from(&changes[0].0, depth, encoded)
+            && path_from(&changes[changes.len() - 1].0, depth, encoded).is_some()
+        {
+            let has_deletion = changes.iter().any(|(_, value)| value.is_none());
+            let resolved = self.state.resolve_child(child)?;
+            // A deletion can collapse the child into a short node, whose path this extension's must
+            // absorb for the trie to stay canonical, so the child builds in this frame's own
+            // scratch rather than in a loan it gives back.
+            if has_deletion {
+                let updated = self.update(resolved, changes, depth + taken, stack)?;
+                if is_empty_node(updated) {
+                    return Ok(EMPTY_NODE);
                 }
-                Ok(splice_branch(self.bump, payload, start, end, item))
+                let mut buf = [0; MAX_NIBBLES];
+                return node_under(hex_prefix_decode(encoded, &mut buf)?, updated, None, stack);
+            }
+            let carried = {
+                let mut lent = stack.lend();
+                let updated = self.update(resolved, changes, depth + taken, &mut lent)?;
+                if is_empty_node(updated) {
+                    return Ok(EMPTY_NODE);
+                }
+                Carried::of(updated)
+            };
+            let item = carried.write(stack);
+            return Ok(encode_extension_encoded(encoded, item, stack));
+        }
+
+        let mut buf = [0; MAX_NIBBLES];
+        let path = hex_prefix_decode(encoded, &mut buf)?;
+        // A path that would carry the descent past the last nibble of a key belongs to no node the
+        // trie holds, and is what keeps every slice below in range.
+        if depth + path.len() > MAX_NIBBLES {
+            return Err(Error::MalformedPath);
+        }
+        debug_assert!(changes.len() >= 2, "a single change takes update_one");
+        // The change set leaves this path part way along, so the extension becomes the branch the
+        // trie would hold there and the ordinary descent takes it from that point.
+        let low = key_nibbles(&changes[0].0);
+        let high = key_nibbles(&changes[changes.len() - 1].0);
+        let shared = prefix_shared_by_all(&low[depth..], &high[depth..], Some(path));
+        let mut items = [EMPTY_NODE; 16];
+        // The branch arm runs on the children below rather than on a branch anyone encodes, so what
+        // is left of this extension is a child this frame holds rather than one any later trie
+        // could find.
+        let mut prebuilt = None;
+        items[path[shared] as usize] = if shared + 1 < path.len() {
+            let extension = encode_extension(&path[shared + 1..], child, stack);
+            prebuilt = Some((path[shared], extension));
+            reference(extension, stack)
+        } else {
+            child
+        };
+        let updated = self.update_branch(items, changes, depth + shared, prebuilt, stack)?;
+        if is_empty_node(updated) {
+            return Ok(EMPTY_NODE);
+        }
+        node_under(&path[..shared], updated, None, stack)
+    }
+
+    /// The RLP of the node that replaces this branch, which a deletion can leave collapsed into a
+    /// short node or empty.
+    fn update_branch<'s>(
+        &self,
+        mut children: [&'s [u8]; 16],
+        changes: &[Change],
+        depth: usize,
+        prebuilt: Prebuilt<'s>,
+        stack: &mut DynStack<'s>,
+    ) -> Result<&'s [u8], Error> {
+        let has_deletion = changes.iter().any(|(_, value)| value.is_none());
+
+        // A collapse can pick a child this frame builds only when every child it leaves alone is
+        // already empty, since one surviving witness child is enough to keep the branch a branch.
+        let collapse_reaches_built = has_deletion && {
+            // Ordered, distinct keys put at least one nibble below this node, so `depth` is short
+            // of a whole key and every change still has a nibble here.
+            let touched = changes
+                .iter()
+                .fold(0u16, |mask, (key, _)| mask | 1 << nibble_at(key, depth));
+            children
+                .iter()
+                .enumerate()
+                .all(|(nibble, child)| touched & (1 << nibble) != 0 || is_empty_node(child))
+        };
+        // Room for the one child a collapse could still read, taken from this frame's own scratch
+        // rather than from what it lends, so the loans a child returns leave it standing.
+        let mut spare = collapse_reaches_built.then(|| stack.alloc(MAX_BRANCH_RLP));
+        let mut built: Prebuilt<'s> = None;
+        for (nibble, child_changes) in changes_by_nibble(changes, depth) {
+            // Sorted keys leave this child a contiguous sub-slice, so its subtree is finished here
+            // and only the item the parent references it through has to outlive it.
+            let child = match prebuilt {
+                Some((prebuilt, node_rlp)) if prebuilt == nibble => node_rlp,
+                _ => self.state.resolve_child(children[nibble as usize])?,
+            };
+            let carried = {
+                let mut lent = stack.lend();
+                let updated = self.update(child, child_changes, depth + 1, &mut lent)?;
+                if !is_empty_node(updated)
+                    && let Some(spare) = spare.take()
+                {
+                    let len = updated.len();
+                    if len > MAX_BRANCH_RLP {
+                        return Err(Error::OversizedNode);
+                    }
+                    spare[..len].copy_from_slice(updated);
+                    let spare: &'s [u8] = spare;
+                    built = Some((nibble, &spare[..len]));
+                }
+                Carried::of(updated)
+            };
+            children[nibble as usize] = carried.write(stack);
+        }
+
+        if has_deletion {
+            // A prebuilt child no change reaches keeps its slot and its encoding. A change that
+            // reaches it overwrites that slot, so the entry a collapse could read is the one this
+            // frame rebuilt, and where it rebuilt nothing the slot is empty and no collapse
+            // reaches it.
+            debug_assert!(
+                built.is_some()
+                    || prebuilt.is_none_or(|(nibble, _)| {
+                        !changes
+                            .iter()
+                            .any(|(key, _)| nibble_at(key, depth) == nibble)
+                            || is_empty_node(children[nibble as usize])
+                    }),
+                "a collapse could read a prebuilt child the branch loop overwrote"
+            );
+            return self.close_branch(&children, built.or(prebuilt), stack);
+        }
+        Ok(encode_branch(&children, stack))
+    }
+
+    /// The subtree a change set alone shapes, built top down.
+    ///
+    /// Applying the changes one at a time would re-encode the node under construction once per
+    /// change and reach back into what it had just built by hash, holding every intermediate alive
+    /// until the last change lands. Taking the whole change set at once instead makes what this
+    /// holds a function of the depth of the trie rather than of the size of the change set.
+    ///
+    /// Removals are dropped rather than applied, since a subtree with no node in it holds nothing
+    /// to remove, and they are the reason a subtree is delimited by the writes it carries rather
+    /// than by every key in it.
+    fn build_subtree<'s>(
+        &self,
+        changes: &[Change],
+        depth: usize,
+        existing: Option<(&[u8], &'s [u8])>,
+        stack: &mut DynStack<'s>,
+    ) -> Result<&'s [u8], Error> {
+        let mut writes = changes
+            .iter()
+            .filter_map(|(key, value)| value.map(|value| (key, value)));
+        let Some((first, first_value)) = writes.next() else {
+            // Nothing is written here, so only what the subtree already held can remain.
+            return Ok(match existing {
+                Some((path, value)) => encode_leaf(path, value, stack),
+                None => EMPTY_NODE,
+            });
+        };
+        let first_nibbles = key_nibbles(first);
+        let last = writes.next_back();
+        if last.is_none() && existing.is_none() {
+            let value = self.values.encode(first_value, stack);
+            return Ok(encode_leaf(&first_nibbles[depth..], value, stack));
+        }
+
+        let last_nibbles = last.map(|(key, _)| key_nibbles(key));
+        let low = &first_nibbles[depth..];
+        let high = last_nibbles.as_ref().map_or(low, |last| &last[depth..]);
+        let shared = prefix_shared_by_all(low, high, existing.map(|(path, _)| path));
+        let split = depth + shared;
+        // An entry that survived the writes parts from them before its path ends, and that path
+        // ends where a key does, so both it and the writes still have a nibble at the split.
+        let existing = existing.map(|(path, value)| (path[shared], &path[shared + 1..], value));
+
+        let mut items = [EMPTY_NODE; 16];
+        for (nibble, child_changes) in changes_by_nibble(changes, split)
+            .filter(|(_, child_changes)| child_changes.iter().any(|(_, value)| value.is_some()))
+        {
+            // The entry the subtree already held joins the changes that share its nibble, and
+            // stands alone below only when no write reaches it.
+            let existing_below = existing
+                .filter(|(existing_nibble, _, _)| *existing_nibble == nibble)
+                .map(|(_, path, value)| (path, value));
+            let carried = {
+                let mut lent = stack.lend();
+                Carried::of(self.build_subtree(
+                    child_changes,
+                    split + 1,
+                    existing_below,
+                    &mut lent,
+                )?)
+            };
+            items[nibble as usize] = carried.write(stack);
+        }
+
+        if let Some((nibble, path, value)) = existing
+            && is_empty_node(items[nibble as usize])
+        {
+            let carried = {
+                let mut lent = stack.lend();
+                Carried::of(encode_leaf(path, value, &mut lent))
+            };
+            items[nibble as usize] = carried.write(stack);
+        }
+
+        // The lowest and the highest entry part at the split, so the branch always keeps two
+        // children and never needs collapsing.
+        Ok(branch_under(&low[..shared], &items, stack))
+    }
+
+    /// Applies one change to this node, whose subtree its key reaches with the nibbles it carries
+    /// from `depth` left.
+    ///
+    /// The key stays packed, since a node whose path the key follows is one whose path is compared
+    /// against the bytes it already sits in and whose encoding the change leaves alone. Only a key
+    /// that parts from a node is expanded, and only in the frame that splits it.
+    fn update_one<'s>(
+        &self,
+        node_rlp: &'s [u8],
+        key: &B256,
+        depth: usize,
+        value: Option<u32>,
+        stack: &mut DynStack<'s>,
+    ) -> Result<&'s [u8], Error> {
+        if is_empty_node(node_rlp) {
+            return Ok(self.leaf_or_empty(key, depth, value, stack));
+        }
+
+        match decode_node(node_rlp)? {
+            Node::Leaf {
+                path: encoded,
+                value: present,
+            } => {
+                // Every key is a hash of one length, so a leaf ends exactly where a key does. A
+                // leaf reaching any other depth belongs to no node the trie holds,
+                // and answering a removal with it would leave the branch above
+                // fuller than the scratch is sized for.
+                if let Some(taken) = path_from(key, depth, encoded) {
+                    if depth + taken != MAX_NIBBLES {
+                        return Err(Error::MalformedPath);
+                    }
+                    return Ok(self.leaf_or_empty(key, depth, value, stack));
+                }
+                let mut buf = [0; MAX_NIBBLES];
+                let path = hex_prefix_decode(encoded, &mut buf)?;
+                if depth + path.len() != MAX_NIBBLES {
+                    return Err(Error::MalformedPath);
+                }
+
+                // The key is not this leaf's, so it was never in this subtree.
+                let Some(value) = value else {
+                    return Ok(node_rlp);
+                };
+
+                // Both keys move under a branch at the nibble where they part, which is short of
+                // where either path ends because the two are the same length and differ.
+                let written = key_nibbles(key);
+                let remaining = &written[depth..];
+                let shared = common_prefix_len(path, remaining);
+                let leaf = encode_leaf(&path[shared + 1..], present, stack);
+                let existing_item = reference(leaf, stack);
+                Ok(self.parting_branch(path, existing_item, remaining, shared, value, stack))
             }
 
-            Node::Extension { path, child } => {
-                let mut buf = [0; MAX_NIBBLES];
-                let path = hex_prefix_nibbles(path, &mut buf)?;
-                let shared = common_prefix_len(path, remaining);
-
-                if shared == path.len() {
-                    let resolved = self.child(child)?;
-                    let updated = self.update_one(resolved, &remaining[shared..], value, index)?;
-                    if is_empty_node(updated) {
-                        return Ok(EMPTY_NODE);
-                    }
+            Node::Extension {
+                path: encoded,
+                child,
+            } => {
+                if let Some(taken) = path_from(key, depth, encoded) {
+                    let resolved = self.state.resolve_child(child)?;
                     // A deletion can collapse the child into a short node, whose path this
                     // extension's must absorb for the trie to stay canonical.
                     if value.is_none() {
-                        let mut child_buf = [0; MAX_NIBBLES];
-                        let mut merged = [0; MAX_NIBBLES];
-                        match decode_node(updated)? {
-                            Node::Leaf {
-                                path: child_path,
-                                value,
-                            } => {
-                                let merged = merge_paths(
-                                    path,
-                                    hex_prefix_nibbles(child_path, &mut child_buf)?,
-                                    &mut merged,
-                                )?;
-                                return Ok(encode_leaf(self.bump, merged, value));
-                            }
-                            Node::Extension {
-                                path: child_path,
-                                child,
-                            } => {
-                                let merged = merge_paths(
-                                    path,
-                                    hex_prefix_nibbles(child_path, &mut child_buf)?,
-                                    &mut merged,
-                                )?;
-                                return Ok(encode_extension(self.bump, merged, child));
-                            }
-                            Node::Branch(_) => {}
+                        let updated =
+                            self.update_one(resolved, key, depth + taken, value, stack)?;
+                        if is_empty_node(updated) {
+                            return Ok(EMPTY_NODE);
                         }
+                        let mut buf = [0; MAX_NIBBLES];
+                        let path = hex_prefix_decode(encoded, &mut buf)?;
+                        return node_under(path, updated, None, stack);
                     }
-                    let reference = self.reference(updated, index);
-                    return Ok(encode_extension(self.bump, path, reference));
+                    let carried = {
+                        let mut lent = stack.lend();
+                        let updated =
+                            self.update_one(resolved, key, depth + taken, value, &mut lent)?;
+                        if is_empty_node(updated) {
+                            return Ok(EMPTY_NODE);
+                        }
+                        Carried::of(updated)
+                    };
+                    let item = carried.write(stack);
+                    return Ok(encode_extension_encoded(encoded, item, stack));
+                }
+
+                let mut buf = [0; MAX_NIBBLES];
+                let path = hex_prefix_decode(encoded, &mut buf)?;
+                // A path that would carry the descent past the last nibble of a key belongs to no
+                // node the trie holds. Refusing it before the split builds anything is what keeps a
+                // witness the descent turns down from costing it scratch.
+                if depth + path.len() > MAX_NIBBLES {
+                    return Err(Error::MalformedPath);
                 }
 
                 // The key leaves the path, so it was never in this subtree.
@@ -441,483 +783,171 @@ impl PathState {
 
                 // Split the extension where the key leaves it, putting what is left of each side
                 // under a branch.
-                let mut items = [EMPTY_NODE; 16];
-                items[path[shared] as usize] = if shared + 1 < path.len() {
-                    let extension = encode_extension(self.bump, &path[shared + 1..], child);
-                    self.reference(extension, index)
+                let written = key_nibbles(key);
+                let remaining = &written[depth..];
+                let shared = common_prefix_len(path, remaining);
+                let existing_item = if shared + 1 < path.len() {
+                    let extension = encode_extension(&path[shared + 1..], child, stack);
+                    reference(extension, stack)
                 } else {
                     child
                 };
-                if shared >= remaining.len() {
-                    return Err(Error::ValueInBranch);
-                }
-                let leaf = encode_leaf(self.bump, &remaining[shared + 1..], value);
-                items[remaining[shared] as usize] = self.reference(leaf, index);
-
-                let branch = encode_branch(self.bump, &items);
-                if shared == 0 {
-                    return Ok(branch);
-                }
-                let reference = self.reference(branch, index);
-                Ok(encode_extension(self.bump, &path[..shared], reference))
+                Ok(self.parting_branch(path, existing_item, remaining, shared, value, stack))
             }
 
-            Node::Leaf {
-                path,
-                value: present,
-            } => {
-                let mut buf = [0; MAX_NIBBLES];
-                let path = hex_prefix_nibbles(path, &mut buf)?;
-                if path == remaining {
-                    return Ok(match value {
-                        Some(value) => encode_leaf(self.bump, path, value),
-                        None => EMPTY_NODE,
-                    });
+            Node::Branch(branch) => {
+                if depth == MAX_NIBBLES {
+                    return Err(Error::ValueInBranch);
+                }
+                let nibble = nibble_at(key, depth);
+                let (start, end) = branch.child_span(nibble)?;
+                let child = self.state.resolve_child(&branch.payload[start..end])?;
+
+                // A deletion can leave the branch with a single child or none at all, which only
+                // inspecting every one of them tells, and a collapse may still read the child's own
+                // encoding, so it builds in this frame's own scratch rather than in a loan.
+                if value.is_none() {
+                    let mut children = branch_children(branch.payload)?;
+                    let updated = self.update_one(child, key, depth + 1, value, stack)?;
+                    children[nibble as usize] = reference(updated, stack);
+                    return self.close_branch(&children, Some((nibble, updated)), stack);
                 }
 
-                // The key is not this leaf's, so it was never in this subtree.
-                let Some(value) = value else {
-                    return Ok(node_rlp);
+                let carried = {
+                    let mut lent = stack.lend();
+                    Carried::of(self.update_one(child, key, depth + 1, value, &mut lent)?)
                 };
-
-                // Both keys move under a branch at the nibble where they part.
-                let shared = common_prefix_len(path, remaining);
-                if shared >= path.len() || shared >= remaining.len() {
-                    return Err(Error::ValueInBranch);
-                }
-                let mut items = [EMPTY_NODE; 16];
-                let leaf = encode_leaf(self.bump, &path[shared + 1..], present);
-                items[path[shared] as usize] = self.reference(leaf, index);
-                let leaf = encode_leaf(self.bump, &remaining[shared + 1..], value);
-                items[remaining[shared] as usize] = self.reference(leaf, index);
-
-                let branch = encode_branch(self.bump, &items);
-                if shared == 0 {
-                    return Ok(branch);
-                }
-                let reference = self.reference(branch, index);
-                Ok(encode_extension(self.bump, &path[..shared], reference))
+                let item = carried.write(stack);
+                splice_branch(branch.payload, start, end, item, stack)
             }
         }
     }
 
-    /// Replaces a branch a deletion left with one child by the short node the canonical trie asks
-    /// for, which carries the child's nibble at the front of its path.
-    fn collapse(&mut self, nibble: u8, item: &'static [u8]) -> Result<&'static [u8], Error> {
-        let child_rlp = self.child(item)?;
-        match decode_node(child_rlp)? {
-            Node::Leaf { path, value } => {
-                let (mut buf, mut merged) = ([0; MAX_NIBBLES], [0; MAX_NIBBLES]);
-                let path =
-                    merge_paths(&[nibble], hex_prefix_nibbles(path, &mut buf)?, &mut merged)?;
-                Ok(encode_leaf(self.bump, path, value))
-            }
-            Node::Extension { path, child } => {
-                let (mut buf, mut merged) = ([0; MAX_NIBBLES], [0; MAX_NIBBLES]);
-                let path =
-                    merge_paths(&[nibble], hex_prefix_nibbles(path, &mut buf)?, &mut merged)?;
-                Ok(encode_extension(self.bump, path, child))
-            }
-            // A branch cannot absorb the nibble, so an extension of it carries it instead.
-            Node::Branch(_) => Ok(encode_extension(self.bump, &[nibble], item)),
-        }
-    }
-
-    /// The item a parent references `node_rlp` through, which is the node itself when short enough
-    /// to sit in place and the RLP of its hash otherwise.
+    /// The branch that parts the subtree `existing_item` references from the key being written,
+    /// each under the nibble its own path takes at the split, with the nibbles they share above
+    /// it.
     ///
-    /// A hashed node joins the index only when `index` is set, which the callers that can go on to
-    /// resolve it by hash ask for. Every other caller receives the node up the call stack instead
-    /// and would only be paying for an entry nothing reads.
-    fn reference(&mut self, node_rlp: &'static [u8], index: bool) -> &'static [u8] {
-        if node_rlp.len() < DIGEST_LEN {
-            return node_rlp;
-        }
-        let digest = keccak256(node_rlp);
-        if index {
-            self.nodes.insert(digest, node_rlp);
-        }
-        encode_digest(self.bump, digest)
-    }
-}
-
-/// A decoded trie node. Paths stay hex-prefix encoded and children stay whole RLP items, both
-/// borrowing the node's own encoding, so a re-encoding can copy the parts it does not change.
-enum Node<'a> {
-    Leaf { path: &'a [u8], value: &'a [u8] },
-    Extension { path: &'a [u8], child: &'a [u8] },
-    Branch(&'a [u8]),
-}
-
-/// Decodes a node far enough to tell which of the three it is, which for a branch is two item
-/// headers. Its children stay in the payload, so an update that replaces one never pays to
-/// materialize the fifteen it leaves alone.
-fn decode_node(node_rlp: &[u8]) -> Result<Node<'_>, Error> {
-    let payload = list_payload(node_rlp)?;
-    let mut rest = payload;
-    let first = split_item(&mut rest)?;
-    let second = split_item(&mut rest)?;
-
-    if !rest.is_empty() {
-        return Ok(Node::Branch(payload));
+    /// Both still have a nibble there, since a key parts from a path in the trie before either
+    /// ends.
+    fn parting_branch<'s>(
+        &self,
+        existing_path: &[u8],
+        existing_item: &'s [u8],
+        written: &[u8],
+        shared: usize,
+        value: u32,
+        stack: &mut DynStack<'s>,
+    ) -> &'s [u8] {
+        let mut items = [EMPTY_NODE; 16];
+        items[existing_path[shared] as usize] = existing_item;
+        let value = self.values.encode(value, stack);
+        let leaf = encode_leaf(&written[shared + 1..], value, stack);
+        items[written[shared] as usize] = reference(leaf, stack);
+        branch_under(&written[..shared], &items, stack)
     }
 
-    let mut path = first;
-    let path = alloy_rlp::Header::decode_bytes(&mut path, false)?;
-    let &flags = path.first().ok_or(Error::MalformedPath)?;
-    if flags & HEX_PREFIX_FLAG_LEAF == 0 {
-        return Ok(Node::Extension {
-            path,
-            child: second,
-        });
+    /// The leaf `value` writes at the nibbles `key` carries from `depth`, or the empty node when it
+    /// removes one instead.
+    fn leaf_or_empty<'s>(
+        &self,
+        key: &B256,
+        depth: usize,
+        value: Option<u32>,
+        stack: &mut DynStack<'s>,
+    ) -> &'s [u8] {
+        let Some(value) = value else {
+            return EMPTY_NODE;
+        };
+        let value = self.values.encode(value, stack);
+        encode_leaf_from_key(key, depth, value, stack)
     }
-    let mut value = second;
-    let value = alloy_rlp::Header::decode_bytes(&mut value, false)?;
-    Ok(Node::Leaf { path, value })
-}
 
-/// Decodes only the branch child at `nibble`, leaving the fifteen a walk will not follow unparsed.
-/// Returns `None` when the node turns out to be a leaf or an extension.
-fn decode_branch_child(node_rlp: &[u8], nibble: u8) -> Result<Option<&[u8]>, Error> {
-    let mut payload = list_payload(node_rlp)?;
-    let mut child = None;
-    for index in 0..=nibble {
-        if payload.is_empty() {
-            return Ok(None);
-        }
-        let item = split_item(&mut payload)?;
-        if index == nibble {
-            child = Some(item);
+    /// The node a branch closes as once a deletion has been applied to its children, which is that
+    /// branch itself unless the deletion left it with one child or none at all.
+    ///
+    /// One child left collapses into the short node the canonical trie asks for, which carries that
+    /// child's nibble at the front of its path.
+    fn close_branch<'s>(
+        &self,
+        children: &[&'s [u8]; 16],
+        prebuilt: Prebuilt<'s>,
+        stack: &mut DynStack<'s>,
+    ) -> Result<&'s [u8], Error> {
+        match filled_children(children) {
+            Filled::None => Ok(EMPTY_NODE),
+            Filled::One(nibble) => {
+                let item = children[nibble as usize];
+                let child_rlp = match prebuilt.filter(|(built, _)| *built == nibble) {
+                    Some((_, node_rlp)) => node_rlp,
+                    None => self.state.resolve_child(item)?,
+                };
+                node_under(&[nibble], child_rlp, Some(item), stack)
+            }
+            Filled::Many => Ok(encode_branch(children, stack)),
         }
     }
-
-    // A leaf or an extension holds two items, so what proves this is a branch is a third. Slot 2
-    // and beyond cleared that bar by being reached at all, and the two below it look ahead.
-    if nibble == 0 {
-        if payload.is_empty() {
-            return Ok(None);
-        }
-        split_item(&mut payload)?;
-    }
-    if nibble < 2 && payload.is_empty() {
-        return Ok(None);
-    }
-    Ok(child)
 }
 
-/// The range the child at `nibble` occupies in a branch's payload.
-fn child_span(payload: &[u8], nibble: u8) -> Result<(usize, usize), Error> {
-    let mut rest = payload;
-    let mut start = 0;
-    for _ in 0..nibble {
-        start += split_item(&mut rest)?.len();
-    }
-    Ok((start, start + split_item(&mut rest)?.len()))
+/// The sub-slices of `changes` whose keys share a nibble at `depth`, each with that nibble. Ordered
+/// keys leave the nibble non-decreasing, so the changes sharing one are contiguous.
+fn changes_by_nibble(changes: &[Change], depth: usize) -> impl Iterator<Item = (u8, &[Change])> {
+    changes
+        .chunk_by(move |left, right| nibble_at(&left.0, depth) == nibble_at(&right.0, depth))
+        .map(move |child_changes| (nibble_at(&child_changes[0].0, depth), child_changes))
 }
 
-/// The child items of a branch, given its payload.
-fn branch_children(payload: &[u8]) -> Result<[&[u8]; 16], Error> {
-    let mut rest = payload;
-    let mut children = [EMPTY_NODE; 16];
-    for child in &mut children {
-        *child = split_item(&mut rest)?;
+/// What a set of sorted keys and a path already in the subtree all share below the depth they are
+/// taken from, which is the least any pair of them shares, so the lowest key, the highest and that
+/// path settle it. A subtree spans every key below its own path, which is why it can never lengthen
+/// what they share.
+fn prefix_shared_by_all(low: &[u8], high: &[u8], existing_path: Option<&[u8]>) -> usize {
+    let shared = common_prefix_len(low, high);
+    match existing_path {
+        Some(path) => shared
+            .min(common_prefix_len(low, path))
+            .min(common_prefix_len(high, path)),
+        None => shared,
     }
-    if !is_empty_node(split_item(&mut rest)?) {
-        return Err(Error::ValueInBranch);
-    }
-    if !rest.is_empty() {
-        return Err(Error::Rlp(alloy_rlp::Error::UnexpectedLength));
-    }
-    Ok(children)
 }
 
-/// How many children a branch still holds, which only a deletion can bring below two.
-enum Filled {
-    None,
-    One(u8),
-    Many,
-}
-
-/// Which children of a branch are still filled.
-fn filled_children(children: &[&[u8]; 16]) -> Filled {
-    let mut filled = Filled::None;
-    for (nibble, child) in children.iter().enumerate() {
-        if is_empty_node(child) {
-            continue;
-        }
-        match filled {
-            Filled::None => filled = Filled::One(nibble as u8),
-            _ => return Filled::Many,
-        }
-    }
-    filled
-}
-
-/// Whether an item is the RLP of an empty node, which is how a parent references an absent child.
+/// The node `node_rlp` becomes with `path` nibbles above it, which a short node absorbs into its
+/// own path for the trie to stay canonical and a branch takes an extension for.
 ///
-/// Written as a pattern match because comparing against [`EMPTY_NODE`] with `==` compiles to a
-/// `memcmp` call whose overhead dwarfs this one-byte check, and every branch child pays it.
-fn is_empty_node(item: &[u8]) -> bool {
-    matches!(item, [byte] if *byte == alloy_rlp::EMPTY_STRING_CODE)
-}
-
-/// Splits `len` bytes off the front of `buf`, leaving `buf` on what follows them.
-fn split_payload<'a>(buf: &mut &'a [u8], len: usize) -> Result<&'a [u8], Error> {
-    if buf.len() < len {
-        return Err(Error::Rlp(alloy_rlp::Error::InputTooShort));
+/// `item` is what a parent already references the subtree through, which only the branch case needs
+/// and which sparing lets the other two avoid hashing a node they re-encode anyway.
+fn node_under<'s>(
+    path: &[u8],
+    node_rlp: &'s [u8],
+    item: Option<&'s [u8]>,
+    stack: &mut DynStack<'s>,
+) -> Result<&'s [u8], Error> {
+    if path.is_empty() {
+        return Ok(node_rlp);
     }
-    let (payload, rest) = buf.split_at(len);
-    *buf = rest;
-    Ok(payload)
-}
-
-/// Splits the RLP item at the front of `buf` off whole, header included.
-fn split_item<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8], Error> {
-    let start = *buf;
-    let header = alloy_rlp::Header::decode(buf)?;
-    split_payload(buf, header.payload_length)?;
-    Ok(&start[..start.len() - buf.len()])
-}
-
-/// The payload of the list `node_rlp` encodes.
-fn list_payload(node_rlp: &[u8]) -> Result<&[u8], Error> {
-    let mut buf = node_rlp;
-    let header = alloy_rlp::Header::decode(&mut buf)?;
-    if !header.list {
-        return Err(Error::Rlp(alloy_rlp::Error::UnexpectedString));
-    }
-    split_payload(&mut buf, header.payload_length)
-}
-
-/// RLP-encodes a leaf holding `value` at `path`.
-fn encode_leaf(bump: &'static Bump, path: &[u8], value: &[u8]) -> &'static [u8] {
-    let mut buf = [0; MAX_ENCODED_PATH];
-    let path = hex_prefix_encode(path, true, &mut buf);
-    let (out, pos) = alloc_list(bump, path.length() + value.length());
-    let pos = write_string(out, pos, path);
-    write_string(out, pos, value);
-    out
-}
-
-/// RLP-encodes an extension at `path` referencing `child`, which is already a whole RLP item.
-fn encode_extension(bump: &'static Bump, path: &[u8], child: &[u8]) -> &'static [u8] {
-    let mut buf = [0; MAX_ENCODED_PATH];
-    let path = hex_prefix_encode(path, false, &mut buf);
-    let (out, pos) = alloc_list(bump, path.length() + child.len());
-    let pos = write_string(out, pos, path);
-    out[pos..pos + child.len()].copy_from_slice(child);
-    out
-}
-
-/// RLP-encodes a branch from its child items, leaving the value slot a trie of fixed-length keys
-/// never fills empty.
-fn encode_branch(bump: &'static Bump, children: &[&[u8]; 16]) -> &'static [u8] {
-    let payload_length = children.iter().map(|child| child.len()).sum::<usize>() + 1;
-    let (out, mut pos) = alloc_list(bump, payload_length);
-    for child in children {
-        out[pos..pos + child.len()].copy_from_slice(child);
-        pos += child.len();
-    }
-    out[pos] = alloy_rlp::EMPTY_STRING_CODE;
-    out
-}
-
-/// Re-encodes a branch with the `start..end` bytes of its payload, one child, replaced by `item`.
-///
-/// The children on either side keep the bytes they arrived as, so replacing one costs two copies
-/// rather than reassembling all sixteen.
-fn splice_branch(
-    bump: &'static Bump,
-    payload: &[u8],
-    start: usize,
-    end: usize,
-    item: &[u8],
-) -> &'static [u8] {
-    let payload_length = payload.len() - (end - start) + item.len();
-    let (out, pos) = alloc_list(bump, payload_length);
-    out[pos..pos + start].copy_from_slice(&payload[..start]);
-    let pos = pos + start;
-    out[pos..pos + item.len()].copy_from_slice(item);
-    let pos = pos + item.len();
-    out[pos..].copy_from_slice(&payload[end..]);
-    out
-}
-
-/// RLP-encodes `digest` as the 33-byte item a parent references a hashed node through.
-fn encode_digest(bump: &'static Bump, digest: B256) -> &'static [u8] {
-    let out = bump.alloc_slice_fill_copy(1 + DIGEST_LEN, 0);
-    out[0] = alloy_rlp::EMPTY_STRING_CODE + DIGEST_LEN as u8;
-    out[1..].copy_from_slice(digest.as_slice());
-    out
-}
-
-/// RLP-encodes a value into the arena through an `N`-byte buffer, which the caller sizes from the
-/// value's widest encoding.
-fn encode_value<const N: usize>(bump: &'static Bump, value: impl Encodable) -> &'static [u8] {
-    debug_assert!(
-        value.length() <= N,
-        "the buffer is sized for the widest encoding of the value"
-    );
-    let mut buf = [0; N];
-    let mut out = buf.as_mut_slice();
-    value.encode(&mut out);
-    let written = N - out.len();
-    bump.alloc_slice_copy(&buf[..written])
-}
-
-/// Allocates a list of `payload_length` bytes in the arena and returns it with the position its
-/// payload starts at.
-fn alloc_list(bump: &'static Bump, payload_length: usize) -> (&'static mut [u8], usize) {
-    let len = alloy_rlp::length_of_length(payload_length) + payload_length;
-    let out = bump.alloc_slice_fill_copy(len, 0);
-    let pos = write_header(out, 0, alloy_rlp::EMPTY_LIST_CODE, payload_length);
-    (out, pos)
-}
-
-/// Writes an RLP header with the given base code at `pos` and returns the position after it.
-fn write_header(out: &mut [u8], pos: usize, base_code: u8, payload_length: usize) -> usize {
-    if payload_length < 56 {
-        out[pos] = base_code + payload_length as u8;
-        return pos + 1;
-    }
-    let len_be = payload_length.to_be_bytes();
-    let num_len_bytes = alloy_rlp::length_of_length(payload_length) - 1;
-    out[pos] = base_code + 55 + num_len_bytes as u8;
-    out[pos + 1..pos + 1 + num_len_bytes].copy_from_slice(&len_be[len_be.len() - num_len_bytes..]);
-    pos + 1 + num_len_bytes
-}
-
-/// Writes `bytes` as an RLP string at `pos` and returns the position after it.
-fn write_string(out: &mut [u8], pos: usize, bytes: &[u8]) -> usize {
-    if let [byte] = bytes
-        && *byte < alloy_rlp::EMPTY_STRING_CODE
-    {
-        out[pos] = *byte;
-        return pos + 1;
-    }
-    let pos = write_header(out, pos, alloy_rlp::EMPTY_STRING_CODE, bytes.len());
-    out[pos..pos + bytes.len()].copy_from_slice(bytes);
-    pos + bytes.len()
-}
-
-/// Path holds an odd number of nibbles, so the low nibble of the flag byte is data.
-const HEX_PREFIX_FLAG_ODD: u8 = 0x10;
-/// Node is a leaf rather than an extension.
-const HEX_PREFIX_FLAG_LEAF: u8 = 0x20;
-
-/// Expands a key into its nibbles, most significant first.
-fn key_nibbles(key: &B256) -> [u8; MAX_NIBBLES] {
-    let mut nibbles = [0; MAX_NIBBLES];
-    let (pairs, _) = nibbles.as_chunks_mut::<2>();
-    for (byte, pair) in key.iter().zip(pairs) {
-        pair[0] = byte >> 4;
-        pair[1] = byte & 0x0f;
-    }
-    nibbles
-}
-
-/// The nibble a key holds at `depth`.
-fn nibble_at(key: &B256, depth: usize) -> u8 {
-    let byte = key[depth / 2];
-    if depth.is_multiple_of(2) {
-        byte >> 4
-    } else {
-        byte & 0x0f
-    }
-}
-
-/// Length of the common prefix of two nibble sequences.
-fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
-    left.iter()
-        .zip(right)
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
-/// Expands a hex-prefix encoded path into `out` and returns its nibbles.
-fn hex_prefix_nibbles<'o>(
-    encoded: &[u8],
-    out: &'o mut [u8; MAX_NIBBLES],
-) -> Result<&'o [u8], Error> {
-    let (&flags, rest) = encoded.split_first().ok_or(Error::MalformedPath)?;
-    let is_odd = flags & HEX_PREFIX_FLAG_ODD != 0;
-    let len = 2 * rest.len() + usize::from(is_odd);
-    if len > MAX_NIBBLES {
-        return Err(Error::MalformedPath);
-    }
-
-    let start = usize::from(is_odd);
-    if is_odd {
-        out[0] = flags & 0x0f;
-    }
-    let (pairs, _) = out[start..len].as_chunks_mut::<2>();
-    for (byte, pair) in rest.iter().zip(pairs) {
-        pair[0] = byte >> 4;
-        pair[1] = byte & 0x0f;
-    }
-    Ok(&out[..len])
-}
-
-/// Encodes `nibbles` into hex-prefix form in `out` and returns the encoding.
-fn hex_prefix_encode<'o>(
-    nibbles: &[u8],
-    is_leaf: bool,
-    out: &'o mut [u8; MAX_ENCODED_PATH],
-) -> &'o [u8] {
-    let is_odd = !nibbles.len().is_multiple_of(2);
-    let out = &mut out[..1 + nibbles.len() / 2];
-
-    let mut flags = if is_leaf { HEX_PREFIX_FLAG_LEAF } else { 0 };
-    let rest = if is_odd {
-        flags |= HEX_PREFIX_FLAG_ODD | nibbles[0];
-        &nibbles[1..]
-    } else {
-        nibbles
+    let (child_path, second, is_leaf) = match decode_node(node_rlp)? {
+        Node::Leaf { path, value } => (path, value, true),
+        Node::Extension { path, child } => (path, child, false),
+        Node::Branch(_) => {
+            let item = item.unwrap_or_else(|| reference(node_rlp, stack));
+            return Ok(encode_extension(path, item, stack));
+        }
     };
-    out[0] = flags;
-    let (pairs, _) = rest.as_chunks::<2>();
-    for (byte, pair) in out[1..].iter_mut().zip(pairs) {
-        *byte = (pair[0] << 4) | pair[1];
-    }
-    out
+    let (mut buf, mut merged) = ([0; MAX_NIBBLES], [0; MAX_NIBBLES]);
+    let merged = merge_paths(path, hex_prefix_decode(child_path, &mut buf)?, &mut merged)?;
+    Ok(if is_leaf {
+        encode_leaf(merged, second, stack)
+    } else {
+        encode_extension(merged, second, stack)
+    })
 }
 
-/// Joins a parent path and its child's into `out`.
-fn merge_paths<'o>(
-    parent: &[u8],
-    child: &[u8],
-    out: &'o mut [u8; MAX_NIBBLES],
-) -> Result<&'o [u8], Error> {
-    let len = parent.len() + child.len();
-    if len > MAX_NIBBLES {
-        return Err(Error::MalformedPath);
+/// The node the branch `items` encode to becomes with `path` nibbles above it, which is that branch
+/// under an extension unless `path`, the nibbles those entries share, is empty.
+fn branch_under<'s>(path: &[u8], items: &[&[u8]; 16], stack: &mut DynStack<'s>) -> &'s [u8] {
+    let branch = encode_branch(items, stack);
+    if path.is_empty() {
+        return branch;
     }
-    out[..parent.len()].copy_from_slice(parent);
-    out[parent.len()..len].copy_from_slice(child);
-    Ok(&out[..len])
-}
-
-#[derive(Debug, thiserror::Error)]
-enum Error {
-    /// The witness holds no node for a hash a walk had to follow.
-    #[error("reached an unresolved node: {0:#}")]
-    NodeNotResolved(B256),
-    /// Errors related to RLP encoding and decoding.
-    #[error("rlp decode error: {0}")]
-    Rlp(#[from] alloy_rlp::Error),
-    /// A branch carried a value, which a trie whose keys are all one length never has.
-    #[error("branch node with value")]
-    ValueInBranch,
-    /// A hex-prefix path was empty or longer than a key.
-    #[error("malformed hex-prefix path")]
-    MalformedPath,
-}
-
-impl From<Error> for WitnessDbError {
-    fn from(error: Error) -> Self {
-        match error {
-            Error::Rlp(error) => Self::Rlp(error),
-            error => Self::TrieWitness(alloc::format!("{error}")),
-        }
-    }
+    let item = reference(branch, stack);
+    encode_extension(path, item, stack)
 }
